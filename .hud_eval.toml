@@ -17,7 +17,7 @@
 # remote = false  # Run the whole rollout remotely on HUD
 
 [claude]
-# model = "claude-sonnet-4-6"
+# model = "claude-opus-4-8"
 # max_tokens = 16384
 # use_computer_beta = true
 

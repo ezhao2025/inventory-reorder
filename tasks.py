@@ -10,7 +10,7 @@ sample, then submits order-up-to-S targets. Reward is a normalized cost score:
 """
 
 # re-export env so `hud eval tasks.py` can find the Environment; import the templates.
-from env import env, inventory_easy, inventory_medium, inventory_hard  # noqa: F401
+from env import env, inventory_easy, inventory_medium, inventory_hard, inventory_sequential  # noqa: F401
 
 _PROMPT = (
     "You manage inventory reordering for a small catalog of products over a 60-day season. "
@@ -34,4 +34,16 @@ _medium.slug = "inventory_medium"
 _hard = inventory_hard(prompt=_PROMPT)
 _hard.slug = "inventory_hard"
 
-tasks = [_easy, _medium, _hard]
+_SEQ_PROMPT = (
+    "You manage inventory for a few products over a 60-day season, reviewing stock once a week. "
+    "Each week: call get_state to see current stock, recent sales, what's in transit, and days "
+    "remaining; then call place_order with a quantity per product for that week. Ordering advances "
+    "the simulation one week and returns the result, including the cost incurred. Repeat until the "
+    "season ends. Order enough to cover demand over the coming weeks given each product's lead time "
+    "— too much wastes holding cost, too little causes stockouts. Demand can spike; when you see "
+    "sales jump, react. Minimize total cost across the whole season."
+)
+_sequential = inventory_sequential(prompt=_SEQ_PROMPT)
+_sequential.slug = "inventory_sequential"
+
+tasks = [_easy, _medium, _hard, _sequential]

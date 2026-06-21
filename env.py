@@ -31,6 +31,7 @@ from hud.graders import EvaluationResult
 from environment import InventoryEnv, SeasonConfig, SKUConfig
 from baselines import do_nothing_policy, make_order_up_to_s
 from grader import run_episode
+from sequential import SequentialSeason, run_sequential
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="[%(levelname)s] %(name)s | %(message)s")
@@ -45,6 +46,10 @@ env = Environment(name="inventory-reorder")
 _SEASON: SeasonConfig | None = None
 _POLICY: dict[str, float] | None = None   # {sku_name: target_S} submitted by the agent
 _OPT_CACHE: dict[int, dict[str, float]] = {}   # season seed -> near-optimal targets (computed once)
+
+# sequential-task state: a live SequentialSeason the agent drives via tools
+_SEQ = None                                # SequentialSeason instance for the active episode
+_SEQ_INTERVAL: int = 7                     # decision interval for the sequential task (weekly)
 
 _HOST = "127.0.0.1"
 _MCP_PORT: int | None = None
@@ -194,6 +199,137 @@ async def submit_policy(targets: dict[str, float]) -> dict[str, Any]:
     return {"accepted": True, "reason": "Policy recorded; it will be evaluated over the full hidden season."}
 
 
+# ── sequential task: tools + scoring ──────────────────────────────────────────
+# The agent drives the season live: get_state() to observe, place_order() to act
+# and advance one decision period (a week). It repeats until the season ends.
+
+
+def _seq_state_payload(state: dict) -> dict[str, Any]:
+    """Shape a SequentialSeason state into a clean tool response (native types)."""
+    if state is None:
+        return {"season_over": True}
+    skus = {}
+    for name, s in state["skus"].items():
+        skus[name] = {
+            "on_hand": int(s["on_hand"]),
+            "sold_last_k_days": int(s["sold_last_k_days"]),
+            "in_transit": [{"arrives_in": int(o["arrives_in"]), "qty": int(o["qty"])}
+                           for o in s["in_transit"]],
+            "holding_rate": float(s["holding_rate"]),
+            "stockout_penalty": float(s["stockout_penalty"]),
+            "unit_cost": float(s["unit_cost"]),
+            "lead_time": int(s["lead_time"]),
+        }
+    return {
+        "season_over": False,
+        "day": int(state["day"]),
+        "days_remaining": int(state["days_remaining"]),
+        "decision_interval_days": int(state["decision_interval"]),
+        "skus": skus,
+    }
+
+
+async def get_state() -> dict[str, Any]:
+    """Observe the current decision point: per-SKU on-hand stock, recent sales,
+    in-transit orders, costs, and how many days remain. Call this each period
+    before deciding how much to order."""
+    assert _SEQ is not None
+    return _seq_state_payload(_SEQ._state())
+
+
+async def place_order(orders: dict[str, float]) -> dict[str, Any]:
+    """Order a quantity per SKU for this period, then advance one week. Returns
+    the new state and the cost incurred over the week just simulated.
+
+    Order what you need to cover demand over the coming weeks given lead time —
+    too much wastes holding cost, too little stocks out. You will see the result
+    and can adjust next week. Demand spikes may appear; react when you see them.
+
+    Args:
+        orders: mapping of SKU name -> order quantity (>= 0). Omit a SKU to order 0.
+    """
+    assert _SEQ is not None and _SEASON is not None
+    if _SEQ.done:
+        return {"season_over": True, "reason": "The season has ended."}
+    names = {s.name for s in _SEASON.skus}
+    try:
+        clean = {k: max(0, int(v)) for k, v in orders.items() if k in names}
+    except (TypeError, ValueError):
+        return {"accepted": False, "reason": "Order quantities must be numbers."}
+    state, period_cost = _SEQ.step(clean)
+    return {
+        "accepted": True,
+        "week_cost": round(float(period_cost), 1),
+        "cumulative_cost": round(float(_SEQ.total_cost), 1),
+        "next_state": _seq_state_payload(state),
+    }
+
+
+_SEQ_OPT_CACHE: dict[tuple, dict[str, float]] = {}  # (seed, interval) -> weekly base-stock targets
+
+
+def _sequential_optimal(season: SeasonConfig, interval: int) -> dict[str, float]:
+    """Near-optimal base-stock targets for the SEQUENTIAL (periodic-review) setting.
+
+    The one-shot optimum under-provisions here: with weekly review, each order must
+    cover demand until the NEXT review plus the lead time, so targets run higher.
+    Coordinate-descent per SKU at the actual decision interval. Cached per
+    (seed, interval). This is the reference 1.0 means — the best weekly policy."""
+    key = (season.seed, interval)
+    if key in _SEQ_OPT_CACHE:
+        return _SEQ_OPT_CACHE[key]
+    targets = {s.name: float(s.base_demand * (interval + s.lead_time)) for s in season.skus}
+    for s in season.skus:
+        best_S, best_cost = targets[s.name], float("inf")
+        hi = int(s.base_demand * (interval + s.lead_time + 12)) + 5
+        for S in range(0, hi + 1, max(1, hi // 40)):
+            trial = dict(targets); trial[s.name] = float(S)
+            cost = run_sequential(season, lambda st, t=trial: make_order_up_to_s(t)(st), interval=interval)
+            if cost < best_cost:
+                best_cost, best_S = cost, float(S)
+        targets[s.name] = best_S
+    _SEQ_OPT_CACHE[key] = targets
+    return targets
+
+
+def _seq_score() -> tuple[float, dict[str, Any]]:
+    """Score the completed sequential season: normalize the agent's total cost
+    between a do-nothing floor and a weekly-tuned order-up-to-S optimum, both run
+    sequentially at the same decision interval. Same [0,1] fraction-of-optimal."""
+    assert _SEASON is not None and _SEQ is not None
+    info: dict[str, Any] = {}
+    if _SEQ.decisions_made == 0:
+        return 0.0, {"reason": "No orders were ever placed."}
+
+    agent_cost = float(_SEQ.total_cost)
+    floor_cost = run_sequential(_SEASON, lambda st: {}, interval=_SEQ_INTERVAL)
+    opt_targets = _sequential_optimal(_SEASON, _SEQ_INTERVAL)  # weekly-tuned reference
+    opt_cost = run_sequential(
+        _SEASON,
+        lambda st: make_order_up_to_s(opt_targets)(st),
+        interval=_SEQ_INTERVAL,
+    )
+
+    agent_r, floor_r, opt_r = -agent_cost, -floor_cost, -opt_cost
+    denom = opt_r - floor_r
+    raw = 0.0 if denom == 0 else (agent_r - floor_r) / denom
+    raw = float(raw)
+    reward = float(max(0.0, min(1.0, raw)))
+
+    info.update({
+        "agent_cost": round(agent_cost, 1),
+        "donothing_cost": round(float(floor_cost), 1),
+        "optimal_cost": round(float(opt_cost), 1),
+        "fraction_of_optimal": round(reward, 3),
+        "raw_score": round(raw, 3),
+        "decisions_made": int(_SEQ.decisions_made),
+        "reason": (f"agent {agent_cost:.0f} vs optimal {opt_cost:.0f} "
+                   f"vs do-nothing {floor_cost:.0f} -> {reward:.2f} of optimal "
+                   f"over {_SEQ.decisions_made} weekly decisions"),
+    })
+    return reward, info
+
+
 # ── mcp capability lifecycle (identical pattern to the template) ───────────────
 
 
@@ -221,7 +357,8 @@ async def _up() -> None:
     global _MCP_PORT, _MCP_SERVER_TASK
     if _MCP_SERVER_TASK is None:
         server = FastMCP(name="inventory-tools")
-        for tool in (read_catalog, peek_recent_demand, submit_policy):
+        for tool in (read_catalog, peek_recent_demand, submit_policy,
+                     get_state, place_order):
             server.tool(tool)
         _MCP_PORT = _free_port()
         _MCP_SERVER_TASK = asyncio.create_task(
@@ -325,3 +462,21 @@ async def inventory_hard(prompt: str) -> AsyncGenerator[Any, Any]:
     """Hard: 5 SKUs, long lead times, two spikes, tighter cost ratio."""
     async for item in _run_season(_HARD_SEASON, "inventory_hard", prompt):
         yield item
+
+
+@env.template()
+async def inventory_sequential(prompt: str) -> AsyncGenerator[Any, Any]:
+    """Sequential: the agent reorders week-by-week, observing state and adapting
+    to demand as the season unfolds (vs. the one-shot tasks' single static policy)."""
+    global _SEQ, _SEASON, _SEQ_INTERVAL
+    _SEASON = _MEDIUM_SEASON          # 3 SKUs with a mid-season spike — good for adapting
+    _SEQ_INTERVAL = 7                 # weekly decisions (~9 over the 60-day season)
+    _SEQ = SequentialSeason(_SEASON, interval=_SEQ_INTERVAL)
+    _SEQ.reset()
+
+    yield prompt  # the agent drives the season via get_state / place_order
+
+    reward, info = _seq_score()
+    logger.info("inventory_sequential reward=%.3f (%s)", reward, info.get("reason", ""))
+    yield EvaluationResult(reward=reward, content=info.get("reason", ""), info=info)
+
