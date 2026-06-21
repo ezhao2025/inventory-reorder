@@ -281,7 +281,7 @@ def _sequential_optimal(season: SeasonConfig, interval: int) -> dict[str, float]
     targets = {s.name: float(s.base_demand * (interval + s.lead_time)) for s in season.skus}
     for s in season.skus:
         best_S, best_cost = targets[s.name], float("inf")
-        hi = int(s.base_demand * (interval + s.lead_time + 12)) + 5
+        hi = int(s.base_demand * (interval + s.lead_time + 20)) + 5
         for S in range(0, hi + 1, max(1, hi // 40)):
             trial = dict(targets); trial[s.name] = float(S)
             cost = run_sequential(season, lambda st, t=trial: make_order_up_to_s(t)(st), interval=interval)
@@ -423,6 +423,19 @@ _HARD_SEASON = SeasonConfig(
     season_length=60, seasonality_amp=0.4, seed=33,
 )
 
+# Hard sequential season: 5 SKUs, long lead times, multiple spikes, high stockout
+# penalties so good inventory management genuinely matters. Tuned for a ~2x
+# floor/optimal gap so agent quality maps to a clear score spread (0.3–0.95).
+_HARD_SEQ_SEASON = SeasonConfig(
+    skus=[
+        SKUConfig(name="widget",   base_demand=12, holding_rate=0.4, stockout_penalty=7.0, unit_cost=1.0, lead_time=12, init_stock=24, spike_days=[21, 42], spike_mult=3.5),
+        SKUConfig(name="gadget",   base_demand=8,  holding_rate=0.5, stockout_penalty=6.0, unit_cost=1.5, lead_time=10, init_stock=18, spike_days=[28],     spike_mult=3.0),
+        SKUConfig(name="gizmo",    base_demand=18, holding_rate=0.3, stockout_penalty=8.0, unit_cost=0.8, lead_time=12, init_stock=36, spike_days=[21, 49], spike_mult=3.0),
+        SKUConfig(name="sprocket", base_demand=5,  holding_rate=0.6, stockout_penalty=6.0, unit_cost=2.0, lead_time=12, init_stock=12, spike_days=[42],     spike_mult=3.5),
+        SKUConfig(name="cog",      base_demand=22, holding_rate=0.3, stockout_penalty=8.0, unit_cost=0.6, lead_time=8,  init_stock=44, spike_days=[28, 49], spike_mult=2.5),
+    ],
+    season_length=63, seasonality_amp=0.4, seed=77,
+)
 
 # ── task templates ────────────────────────────────────────────────────────────
 # One named @env.template per difficulty. HUD discovers tasks by NAME, and a task
@@ -478,5 +491,23 @@ async def inventory_sequential(prompt: str) -> AsyncGenerator[Any, Any]:
 
     reward, info = _seq_score()
     logger.info("inventory_sequential reward=%.3f (%s)", reward, info.get("reason", ""))
+    yield EvaluationResult(reward=reward, content=info.get("reason", ""), info=info)
+
+
+@env.template()
+async def inventory_sequential_hard(prompt: str) -> AsyncGenerator[Any, Any]:
+    """Hard sequential: 5 SKUs, long lead times, multiple spikes, high stockout
+    penalties. Weekly review. Designed so agent quality maps to a clear score
+    spread — the task built to rank models, not just confirm completion."""
+    global _SEQ, _SEASON, _SEQ_INTERVAL
+    _SEASON = _HARD_SEQ_SEASON
+    _SEQ_INTERVAL = 7
+    _SEQ = SequentialSeason(_SEASON, interval=_SEQ_INTERVAL)
+    _SEQ.reset()
+
+    yield prompt
+
+    reward, info = _seq_score()
+    logger.info("inventory_sequential_hard reward=%.3f (%s)", reward, info.get("reason", ""))
     yield EvaluationResult(reward=reward, content=info.get("reason", ""), info=info)
 

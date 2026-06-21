@@ -10,7 +10,8 @@ sample, then submits order-up-to-S targets. Reward is a normalized cost score:
 """
 
 # re-export env so `hud eval tasks.py` can find the Environment; import the templates.
-from env import env, inventory_easy, inventory_medium, inventory_hard, inventory_sequential  # noqa: F401
+from env import (env, inventory_easy, inventory_medium, inventory_hard,  # noqa: F401
+                 inventory_sequential, inventory_sequential_hard)
 
 _PROMPT = (
     "You manage inventory reordering for a small catalog of products over a 60-day season. "
@@ -46,4 +47,7 @@ _SEQ_PROMPT = (
 _sequential = inventory_sequential(prompt=_SEQ_PROMPT)
 _sequential.slug = "inventory_sequential"
 
-tasks = [_easy, _medium, _hard, _sequential]
+_sequential_hard = inventory_sequential_hard(prompt=_SEQ_PROMPT)
+_sequential_hard.slug = "inventory_sequential_hard"
+
+tasks = [_easy, _medium, _hard, _sequential, _sequential_hard]
